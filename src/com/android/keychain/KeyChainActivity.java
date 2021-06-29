@@ -17,6 +17,7 @@
 package com.android.keychain;
 
 import android.annotation.NonNull;
+import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.app.admin.DevicePolicyEventLogger;
@@ -30,7 +31,6 @@ import android.content.pm.UserInfo;
 import android.content.res.Resources;
 import android.net.Uri;
 import android.os.AsyncTask;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.RemoteException;
@@ -40,6 +40,7 @@ import android.security.IKeyChainAliasCallback;
 import android.security.KeyChain;
 import android.stats.devicepolicy.DevicePolicyEnums;
 import android.util.Log;
+import android.view.ContextThemeWrapper;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -49,12 +50,8 @@ import android.widget.ListView;
 import android.widget.RadioButton;
 import android.widget.TextView;
 
-import androidx.appcompat.app.AppCompatActivity;
-
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.keychain.internal.KeyInfoProvider;
-
-import com.google.android.material.snackbar.Snackbar;
 
 import org.bouncycastle.asn1.x509.X509Name;
 
@@ -77,15 +74,8 @@ import java.util.stream.Collectors;
 
 import javax.security.auth.x500.X500Principal;
 
-public class KeyChainActivity extends AppCompatActivity {
+public class KeyChainActivity extends Activity {
     private static final String TAG = "KeyChain";
-
-    // The amount of time to delay showing a snackbar. If the alias is received before the snackbar
-    // is shown, the activity will finish. If the certificate selection dialog is shown before the
-    // snackbar, no snackbar will be shown.
-    private static final long SNACKBAR_DELAY_TIME = 2000;
-    // The minimum amount of time to display a snackbar while loading certificates.
-    private static final long SNACKBAR_MIN_TIME = 1000;
 
     private int mSenderUid;
     private String mSenderPackageName;
@@ -110,25 +100,12 @@ public class KeyChainActivity extends AppCompatActivity {
         }
     }
 
-    // A snackbar to show the user while the KeyChain Activity is loading the certificates.
-    private Snackbar mSnackbar;
-
-    // A remote service may call {@link android.security.KeyChain#choosePrivateKeyAlias} multiple
-    // times, which will result in multiple intents being sent to KeyChainActivity. The time of the
-    // first received intent is recorded in order to ensure the snackbar is displayed for a
-    // minimum amount of time after receiving the first intent.
-    private long mFirstIntentReceivedTimeMillis = 0L;
+    // A dialog to show the user while the KeyChain Activity is loading the
+    // certificates.
+    AlertDialog mLoadingDialog;
 
     private ExecutorService executor = Executors.newSingleThreadExecutor();
     private Handler handler = new Handler(Looper.getMainLooper());
-    private final Runnable mFinishActivity = KeyChainActivity.this::finish;
-    private final Runnable mShowSnackBar = this::showSnackBar;
-
-    @Override
-    protected void onCreate(Bundle savedState) {
-        super.onCreate(savedState);
-        setContentView(R.layout.keychain_activity);
-    }
 
     @Override public void onResume() {
         super.onResume();
@@ -140,9 +117,6 @@ public class KeyChainActivity extends AppCompatActivity {
             return;
         }
         try {
-            // getTargetPackage guarantees that the returned string is
-            // supplied by the system, so that an application can not
-            // spoof its package.
             mSenderPackageName = mSender.getIntentSender().getTargetPackage();
             mSenderUid = getPackageManager().getPackageInfo(
                     mSenderPackageName, 0).applicationInfo.uid;
@@ -156,27 +130,14 @@ public class KeyChainActivity extends AppCompatActivity {
         chooseCertificate();
     }
 
-    @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        handler.removeCallbacks(mFinishActivity);
-    }
-
-    private void showSnackBar() {
-        mFirstIntentReceivedTimeMillis = System.currentTimeMillis();
-        mSnackbar = Snackbar.make(findViewById(R.id.container),
-                String.format(getResources().getString(R.string.loading_certs_message),
-                        getApplicationLabel()), Snackbar.LENGTH_INDEFINITE);
-        mSnackbar.show();
-    }
-
-    private void finishSnackBar() {
-        if (mSnackbar != null) {
-            mSnackbar.dismiss();
-            mSnackbar = null;
-        } else {
-            handler.removeCallbacks(mShowSnackBar);
-        }
+    private void showLoadingDialog() {
+        final Context themedContext = new ContextThemeWrapper(
+                this, com.android.internal.R.style.Theme_Translucent_NoTitleBar);
+        mLoadingDialog = new AlertDialog.Builder(themedContext)
+                .setTitle(R.string.app_name)
+                .setMessage(R.string.loading_certs_message)
+                .create();
+        mLoadingDialog.show();
     }
 
     private void chooseCertificate() {
@@ -248,17 +209,20 @@ public class KeyChainActivity extends AppCompatActivity {
                     finish(null);
                     return;
                 }
-                runOnUiThread(() -> {
-                    finishSnackBar();
-                    displayCertChooserDialog(certAdapter);
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (mLoadingDialog != null) {
+                            mLoadingDialog.dismiss();
+                            mLoadingDialog = null;
+                        }
+                        displayCertChooserDialog(certAdapter);
+                    }
                 });
             }
         };
 
-        // Show a snackbar to the user to indicate long-running task.
-        if (mSnackbar == null) {
-            handler.postDelayed(mShowSnackBar, SNACKBAR_DELAY_TIME);
-        }
+        // Show a dialog to the user to indicate long-running task.
+        showLoadingDialog();
         Uri uri = getIntent().getParcelableExtra(KeyChain.EXTRA_URI);
         String alias = getIntent().getStringExtra(KeyChain.EXTRA_ALIAS);
 
@@ -525,8 +489,20 @@ public class KeyChainActivity extends AppCompatActivity {
             }
         });
 
-        String contextMessage = String.format(res.getString(R.string.requesting_application),
-                getApplicationLabel());
+        // getTargetPackage guarantees that the returned string is
+        // supplied by the system, so that an application can not
+        // spoof its package.
+        String pkg = mSender.getIntentSender().getTargetPackage();
+        PackageManager pm = getPackageManager();
+        CharSequence applicationLabel;
+        try {
+            applicationLabel = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+        } catch (PackageManager.NameNotFoundException e) {
+            applicationLabel = pkg;
+        }
+        String appMessage = String.format(res.getString(R.string.requesting_application),
+                                          applicationLabel);
+        String contextMessage = appMessage;
         Uri uri = getIntent().getParcelableExtra(KeyChain.EXTRA_URI);
         if (uri != null) {
             String hostMessage = String.format(res.getString(R.string.requesting_server),
@@ -553,15 +529,6 @@ public class KeyChainActivity extends AppCompatActivity {
             }
         });
         dialog.show();
-    }
-
-    private String getApplicationLabel() {
-        PackageManager pm = getPackageManager();
-        try {
-            return pm.getApplicationLabel(pm.getApplicationInfo(mSenderPackageName, 0)).toString();
-        } catch (PackageManager.NameNotFoundException e) {
-            return mSenderPackageName;
-        }
     }
 
     @VisibleForTesting
@@ -665,6 +632,10 @@ public class KeyChainActivity extends AppCompatActivity {
     }
 
     private void finish(String alias, boolean isAliasFromPolicy) {
+        if (mLoadingDialog != null) {
+            mLoadingDialog.dismiss();
+            mLoadingDialog = null;
+        }
         if (alias == null || alias.equals(KeyChain.KEY_ALIAS_SELECTION_DENIED)) {
             alias = null;
             setResult(RESULT_CANCELED);
@@ -680,7 +651,7 @@ public class KeyChainActivity extends AppCompatActivity {
             new ResponseSender(keyChainAliasResponse, alias, isAliasFromPolicy).execute();
             return;
         }
-        finishActivity();
+        finish();
     }
 
     private class ResponseSender extends AsyncTask<Void, Void, Void> {
@@ -727,20 +698,7 @@ public class KeyChainActivity extends AppCompatActivity {
             return null;
         }
         @Override protected void onPostExecute(Void unused) {
-            finishActivity();
-        }
-    }
-
-    private void finishActivity() {
-        long timeElapsedSinceFirstIntent =
-                System.currentTimeMillis() - mFirstIntentReceivedTimeMillis;
-        if (mFirstIntentReceivedTimeMillis == 0L
-                || timeElapsedSinceFirstIntent > SNACKBAR_MIN_TIME) {
-            finishSnackBar();
             finish();
-        } else {
-            long remainingTimeToShowSnackBar = SNACKBAR_MIN_TIME - timeElapsedSinceFirstIntent;
-            handler.postDelayed(mFinishActivity, remainingTimeToShowSnackBar);
         }
     }
 
